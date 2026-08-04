@@ -25,6 +25,18 @@ BAD_MARKERS = (
     "sad tab",
 )
 
+INTERNAL_URL_PREFIXES = {
+    # Brave internally canonicalizes some of its WebUI pages to chrome:// when
+    # they are observed through CDP. Both forms represent a successful load.
+    "version": ("brave://version", "chrome://version"),
+    "newtab": (
+        "brave://newtab",
+        "chrome://newtab",
+        "chrome://new-tab-page",
+        "about:newtab",
+    ),
+}
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -155,7 +167,9 @@ def test_page(port: int, name: str, url: str, output_directory: pathlib.Path):
         actual_url = str(value.get("url", ""))
         if name == "renderer" and not actual_url.startswith("data:text/html"):
             raise RuntimeError(f"{name}: unexpected URL {actual_url!r}")
-        if name in {"version", "newtab"} and not actual_url.startswith("brave://"):
+        if name in INTERNAL_URL_PREFIXES and not actual_url.startswith(
+            INTERNAL_URL_PREFIXES[name]
+        ):
             raise RuntimeError(f"{name}: unexpected internal URL {actual_url!r}")
 
         screenshot = session.command("Page.captureScreenshot", {"format": "png"})
