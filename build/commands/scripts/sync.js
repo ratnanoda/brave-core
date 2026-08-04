@@ -15,6 +15,7 @@ import * as Log from '../lib/log.ts'
 import depotTools from '../lib/depotTools.js'
 import { isCI } from '../lib/ciDetect.ts'
 import { applyHalyRebrand } from '../lib/halyRebrand.js'
+import { applyHalySchemeRebrand } from '../lib/halySchemeRebrand.js'
 import syncUtil from '../lib/syncUtils.js'
 import sisoUtils from '../lib/sisoUtils.js'
 
@@ -142,6 +143,7 @@ async function RunCommand(program) {
 
   sisoUtils.writeSisoRc()
   await applyHalyRebrand(config.braveCoreDir)
+  await applyHalySchemeRebrand(config.braveCoreDir)
 }
 
 function commaSeparatedToList(value, defaultValue) {
