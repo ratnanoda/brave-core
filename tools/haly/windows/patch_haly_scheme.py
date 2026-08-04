@@ -159,4 +159,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Keep diagnostics deterministic so CI logs can be compared between builds.
     raise SystemExit(main())
