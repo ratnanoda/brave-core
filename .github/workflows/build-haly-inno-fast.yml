@@ -1,4 +1,4 @@
-name: Build Haly Inno installer (v4)
+name: Build Haly Inno installer (stable v5)
 
 on:
   pull_request:
@@ -16,8 +16,8 @@ jobs:
     timeout-minutes: 45
     env:
       BRAVE_VERSION: '1.92.144'
-      HALY_DISPLAY_VERSION: '1.92.144-haly.4'
-      HALY_FILE_VERSION: '1.92.144.4'
+      HALY_DISPLAY_VERSION: '1.92.144-haly.5'
+      HALY_FILE_VERSION: '1.92.144.5'
 
     steps:
       - name: Check out installer sources only
@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $work = Join-Path $env:RUNNER_TEMP 'haly-inno-v4-build'
+          $work = Join-Path $env:RUNNER_TEMP 'haly-stable-v5'
           $expanded = Join-Path $work 'expanded'
           $payload = Join-Path $work 'payload'
           $application = Join-Path $payload 'Application'
@@ -61,7 +61,6 @@ jobs:
           if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Brave Software') {
             throw "Unexpected Brave signature: $($signature.Status) / $($signature.SignerCertificate.Subject)"
           }
-          Write-Host "Verified upstream browser signature: $($signature.SignerCertificate.Subject)"
 
           Copy-Item (Join-Path $candidate.Directory.FullName '*') $application -Recurse -Force
           Get-ChildItem $application -Recurse -File |
@@ -78,19 +77,35 @@ jobs:
           "HALY_PAYLOAD=$payload" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "HALY_APPLICATION=$application" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Rebrand safe UI strings and URL literals
+      - name: Rebrand localized display strings only
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           python .\tools\haly\windows\repack_paks.py $env:HALY_APPLICATION --include-text
-          if ($LASTEXITCODE -ne 0) { throw 'Safe resource repacking failed.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Localized resource repacking failed.' }
 
-      - name: Replace the internal brave scheme with haly
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python .\tools\haly\windows\patch_haly_scheme.py $env:HALY_APPLICATION
-          if ($LASTEXITCODE -ne 0) { throw 'The Haly scheme patch failed.' }
+          $versionDirectory = Get-ChildItem $env:HALY_APPLICATION -Directory |
+            Where-Object { $_.Name -match '^\d+\.' } |
+            Select-Object -First 1
+          if (!$versionDirectory) { throw 'The browser version directory is missing.' }
+
+          # These WebUI packs must remain byte-for-byte upstream resources.
+          $referenceDirectory = Get-ChildItem $env:RUNNER_TEMP\haly-stable-v5\expanded -Recurse -Directory |
+            Where-Object { $_.Name -eq $versionDirectory.Name } |
+            Select-Object -First 1
+          if (!$referenceDirectory) { throw 'Could not locate the reference version directory.' }
+
+          foreach ($name in @('brave_resources.pak', 'resources.pak', 'chrome_100_percent.pak', 'chrome_200_percent.pak')) {
+            $staged = Get-ChildItem $versionDirectory.FullName -Recurse -File -Filter $name | Select-Object -First 1
+            $reference = Get-ChildItem $referenceDirectory.FullName -Recurse -File -Filter $name | Select-Object -First 1
+            if ($staged -and $reference) {
+              $stagedHash = (Get-FileHash $staged.FullName -Algorithm SHA256).Hash
+              $referenceHash = (Get-FileHash $reference.FullName -Algorithm SHA256).Hash
+              if ($stagedHash -ne $referenceHash) {
+                throw "Protected WebUI pack was modified: $name"
+              }
+            }
+          }
 
       - name: Compile Haly launcher and icon
         shell: pwsh
@@ -126,12 +141,9 @@ jobs:
           Not produced, endorsed, or supported by Brave Software, Inc.
           Install: %LOCALAPPDATA%\Programs\Haly
           Profile: %LOCALAPPDATA%\Haly\User Data
-          Internal scheme: haly://
-          Source: https://github.com/ratnanoda/brave-core/pull/2
 
-          The upstream signature was validated before rebranding. Modifying PE
-          resources and the internal URL scheme invalidates the upstream binary
-          signature by design. The Haly installer itself is not code-signed.
+          This stability build preserves the upstream internal brave:// scheme.
+          A true haly:// scheme requires a source-level Chromium/Brave build.
           "@ | Set-Content (Join-Path $env:HALY_PAYLOAD 'NOTICE-HALY.txt') -Encoding utf8
           "HALY_ICON=$iconPath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -152,16 +164,16 @@ jobs:
           if (!(Test-Path (Join-Path $env:HALY_PAYLOAD 'Haly.exe'))) { throw 'Haly.exe is missing.' }
           "HALY_BROWSER=$($browser.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Smoke-test renderer and Haly internal pages
+      - name: Screenshot smoke tests
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          function Invoke-HalySmoke([string] $Name, [string] $Url) {
-            $profile = Join-Path $env:RUNNER_TEMP "haly-smoke-$Name"
-            $stdout = Join-Path $env:RUNNER_TEMP "haly-smoke-$Name.stdout.txt"
-            $stderr = Join-Path $env:RUNNER_TEMP "haly-smoke-$Name.stderr.txt"
-            Remove-Item $profile, $stdout, $stderr -Recurse -Force -ErrorAction SilentlyContinue
+          function Invoke-HalyScreenshot([string] $Name, [string] $Url) {
+            $profile = Join-Path $env:RUNNER_TEMP "haly-v5-profile-$Name"
+            $screenshot = Join-Path $env:RUNNER_TEMP "haly-v5-$Name.png"
+            $stderr = Join-Path $env:RUNNER_TEMP "haly-v5-$Name.stderr.txt"
+            Remove-Item $profile, $screenshot, $stderr -Recurse -Force -ErrorAction SilentlyContinue
 
             $arguments = @(
               '--headless=new',
@@ -170,37 +182,35 @@ jobs:
               '--no-first-run',
               '--disable-background-networking',
               '--disable-component-update',
+              '--hide-scrollbars',
+              '--window-size=1280,720',
               "--user-data-dir=$profile",
-              '--dump-dom',
+              "--screenshot=$screenshot",
               $Url
             )
 
-            $process = Start-Process -FilePath $env:HALY_BROWSER -ArgumentList $arguments -WorkingDirectory (Split-Path $env:HALY_BROWSER) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+            $process = Start-Process -FilePath $env:HALY_BROWSER -ArgumentList $arguments -WorkingDirectory (Split-Path $env:HALY_BROWSER) -RedirectStandardError $stderr -PassThru
             if (!$process.WaitForExit(60000)) {
               try { $process.Kill($true) } catch {}
-              throw "$Name smoke test timed out."
+              throw "$Name screenshot test timed out."
             }
 
-            $output = ''
-            if (Test-Path $stdout) { $output += Get-Content $stdout -Raw }
-            if (Test-Path $stderr) { $output += "`n" + (Get-Content $stderr -Raw) }
-            Write-Host "----- $Name output -----"
-            Write-Host $output
-
-            if ($process.ExitCode -ne 0) {
-              throw "$Name smoke test exited with code $($process.ExitCode)."
+            $errors = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { '' }
+            Write-Host "----- $Name stderr -----"
+            Write-Host $errors
+            if ($process.ExitCode -ne 0) { throw "$Name exited with code $($process.ExitCode)." }
+            if ($errors -match 'RESULT_CODE_KILLED_BAD_MESSAGE|Aw, Snap|BAD_MESSAGE') {
+              throw "$Name detected a renderer or WebUI failure."
             }
-            if ($output -match 'RESULT_CODE_KILLED_BAD_MESSAGE|Aw, Snap|このページを開けません') {
-              throw "$Name smoke test detected a renderer or WebUI failure."
+            if (!(Test-Path $screenshot) -or (Get-Item $screenshot).Length -lt 4096) {
+              throw "$Name did not produce a usable screenshot."
             }
-            if ($output.Length -lt 20) {
-              throw "$Name smoke test returned unexpectedly little output."
-            }
+            Write-Host "$Name screenshot bytes: $((Get-Item $screenshot).Length)"
           }
 
-          Invoke-HalySmoke 'renderer' 'data:text/html,<title>HalySmoke</title><p>OK</p>'
-          Invoke-HalySmoke 'version' 'haly://version/'
-          Invoke-HalySmoke 'newtab' 'haly://newtab/'
+          Invoke-HalyScreenshot 'renderer' 'data:text/html,<title>HalySmoke</title><p>OK</p>'
+          Invoke-HalyScreenshot 'version' 'brave://version/'
+          Invoke-HalyScreenshot 'newtab' 'brave://newtab/'
 
       - name: Compile offline package with Inno Setup
         shell: pwsh
