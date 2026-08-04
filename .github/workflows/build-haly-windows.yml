@@ -2,9 +2,9 @@ name: Build Haly Windows installer
 
 on:
   workflow_dispatch:
-  push:
+  pull_request:
     branches:
-      - agent/rebrand-brave-to-haly
+      - master
     paths:
       - '.github/workflows/build-haly-windows.yml'
       - 'tools/haly/windows/**'
@@ -208,8 +208,6 @@ jobs:
             throw 'haly-browser.exe is missing.'
           }
 
-          # Renaming does not alter the upstream executable bytes, so its official
-          # Authenticode signature should remain valid.
           $signature = Get-AuthenticodeSignature $browser.FullName
           if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Brave Software') {
             throw "The staged browser signature is invalid: $($signature.Status) / $($signature.SignerCertificate.Subject)"
