@@ -6,7 +6,7 @@ The CI job uses sparse checkout, so it does not download the multi-gigabyte Brav
 
 Stable version 5 fixes the New Tab crash by preserving binary WebUI resources byte-for-byte. The build refuses to continue if `brave_resources.pak`, `resources.pak`, `chrome_100_percent.pak`, or `chrome_200_percent.pak` differs from the verified upstream payload. Product-name replacement is restricted to locale packs and extension `_locales/messages.json` files.
 
-Before an installer artifact is uploaded, the Windows job must successfully render and capture screenshots of a normal renderer page, `brave://version/`, and `brave://newtab/` without a bad-message error.
+Before an installer artifact is uploaded, the Windows job starts the browser with a private profile, connects through the Chrome DevTools Protocol, reads the live DOM, checks for bad-message and sad-tab errors, and captures screenshots of a normal renderer page, `brave://version/`, and `brave://newtab/`.
 
 Isolation boundaries:
 
