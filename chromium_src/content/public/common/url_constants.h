@@ -18,7 +18,8 @@ inline constexpr char kChromeUIScheme[] = "chrome";
 #endif
 
 namespace content {
-inline constexpr char kBraveUIScheme[] = "brave";
+// The symbol remains named kBraveUIScheme for upstream compatibility.
+inline constexpr char kBraveUIScheme[] = "haly";
 }
 
 #endif  // BRAVE_CHROMIUM_SRC_CONTENT_PUBLIC_COMMON_URL_CONSTANTS_H_
