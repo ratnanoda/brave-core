@@ -41,6 +41,25 @@ names, preference keys, and protocol names are intentionally left unchanged.
 Changing those would break compatibility with the upstream source and existing
 profiles.
 
+## Isolated Windows installer
+
+The `Build Haly Windows installer` workflow produces an unsigned Windows x64
+installer from the official, Authenticode-verified Brave stable payload. It
+rebuilds Chromium data-pack resources with Haly branding and adds a dedicated
+launcher and NSIS installer.
+
+The generated package intentionally remains separate from an official Brave
+installation:
+
+- program files: `%LOCALAPPDATA%\Programs\Haly`
+- browser profile: `%LOCALAPPDATA%\Haly\User Data`
+- launcher: `Haly.exe`
+- browser process image: `haly-browser.exe`
+- uninstall registry key: `HalyBrowser`
+- no Brave Update service, default-browser registration, or Brave registry keys
+
+Uninstalling Haly removes the program files but retains the separate profile.
+
 ## Limitations
 
 Hard-coded text inside JavaScript, TypeScript, C++, or other programming-language
