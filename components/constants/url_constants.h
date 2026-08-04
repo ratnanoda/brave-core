@@ -7,7 +7,9 @@
 #define BRAVE_COMPONENTS_CONSTANTS_URL_CONSTANTS_H_
 
 inline constexpr char kChromeExtensionScheme[] = "chrome-extension";
-inline constexpr char kBraveUIScheme[] = "brave";
+// Keep the upstream symbol name to minimize the patch surface, but register
+// Haly's independent internal WebUI scheme in source-built binaries.
+inline constexpr char kBraveUIScheme[] = "haly";
 inline constexpr char kMagnetScheme[] = "magnet";
 inline constexpr char kWidevineTOS[] = "https://policies.google.com/terms";
 inline constexpr char kRewardsUpholdSupport[] =
