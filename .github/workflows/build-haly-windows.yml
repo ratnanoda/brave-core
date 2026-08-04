@@ -1,0 +1,260 @@
+name: Build Haly Windows installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/build-haly-windows.yml'
+      - 'tools/haly/windows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      BRAVE_VERSION: '1.92.144'
+      HALY_DISPLAY_VERSION: '1.92.144-haly.1'
+      HALY_FILE_VERSION: '1.92.144.1'
+
+    steps:
+      - name: Check out Haly sources
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Download and verify official Brave payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'haly-build'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $setup = Join-Path $work 'BraveBrowserStandaloneSetup.exe'
+          $url = "https://github.com/brave/brave-browser/releases/download/v$env:BRAVE_VERSION/BraveBrowserStandaloneSetup.exe"
+
+          curl.exe -L --fail --retry 4 --retry-delay 3 --output $setup $url
+          if (!(Test-Path $setup) -or (Get-Item $setup).Length -lt 50MB) {
+            throw 'The downloaded Brave standalone installer is missing or unexpectedly small.'
+          }
+
+          $signature = Get-AuthenticodeSignature $setup
+          if ($signature.Status -ne 'Valid') {
+            throw "The Brave installer signature is not valid: $($signature.Status)"
+          }
+          if ($signature.SignerCertificate.Subject -notmatch 'Brave Software') {
+            throw "Unexpected Brave installer signer: $($signature.SignerCertificate.Subject)"
+          }
+
+          "HALY_WORK=$work" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BRAVE_SETUP=$setup" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Verified official installer signed by $($signature.SignerCertificate.Subject)"
+
+      - name: Extract standalone browser files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (!$sevenZip) {
+            $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          }
+          if (!(Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+            $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          }
+
+          $stage1 = Join-Path $env:HALY_WORK 'stage-1'
+          $stage2 = Join-Path $env:HALY_WORK 'stage-2'
+          New-Item -ItemType Directory -Force -Path $stage1, $stage2 | Out-Null
+
+          & $sevenZip x $env:BRAVE_SETUP "-o$stage1" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip could not extract the Brave standalone installer (exit $LASTEXITCODE)."
+          }
+
+          $nestedArchive = Get-ChildItem $stage1 -Recurse -File |
+            Where-Object { $_.Extension -eq '.7z' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          if ($nestedArchive) {
+            & $sevenZip x $nestedArchive.FullName "-o$stage2" -y | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip could not extract $($nestedArchive.FullName) (exit $LASTEXITCODE)."
+            }
+            $expandedRoot = $stage2
+          } else {
+            $expandedRoot = $stage1
+          }
+
+          $chromeBin = Get-ChildItem $expandedRoot -Recurse -Directory |
+            Where-Object { $_.Name -eq 'Chrome-bin' } |
+            Select-Object -First 1
+
+          if (!$chromeBin) {
+            $candidate = Get-ChildItem $expandedRoot -Recurse -File -Filter brave.exe |
+              Sort-Object { $_.FullName.Split([IO.Path]::DirectorySeparatorChar).Count } |
+              Select-Object -First 1
+            if (!$candidate) {
+              throw 'Could not find brave.exe in the extracted standalone installer.'
+            }
+            $chromeBin = $candidate.Directory
+          }
+
+          $payload = Join-Path $env:HALY_WORK 'payload'
+          $application = Join-Path $payload 'Application'
+          New-Item -ItemType Directory -Force -Path $application | Out-Null
+          Copy-Item (Join-Path $chromeBin.FullName '*') $application -Recurse -Force
+
+          $browserExecutables = Get-ChildItem $application -Recurse -File -Filter brave.exe
+          if (!$browserExecutables) {
+            throw 'No browser executable was staged.'
+          }
+          foreach ($browserExecutable in $browserExecutables) {
+            Rename-Item $browserExecutable.FullName 'haly-browser.exe'
+          }
+
+          "HALY_PAYLOAD=$payload" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HALY_APPLICATION=$application" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Staged $((Get-ChildItem $payload -Recurse -File | Measure-Object Length -Sum).Sum / 1MB) MiB"
+
+      - name: Rebuild user-facing resource packs as Haly
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/haly/windows/repack_paks.py $env:HALY_APPLICATION --include-text
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The Haly resource rewrite failed.'
+          }
+
+          $remainingExecutables = Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter brave.exe
+          if ($remainingExecutables) {
+            throw 'A brave.exe executable remains in the Haly payload.'
+          }
+
+      - name: Create Haly icon and launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Drawing
+
+          $iconPath = Join-Path $env:HALY_WORK 'Haly.ico'
+          $bitmap = New-Object System.Drawing.Bitmap 256, 256
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+          $graphics.Clear([System.Drawing.Color]::FromArgb(70, 42, 140))
+          $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+          $font = New-Object System.Drawing.Font 'Segoe UI', 150, ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
+          $format = New-Object System.Drawing.StringFormat
+          $format.Alignment = [System.Drawing.StringAlignment]::Center
+          $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+          $graphics.DrawString('H', $font, $brush, (New-Object System.Drawing.RectangleF 0, 0, 256, 246), $format)
+          $icon = [System.Drawing.Icon]::FromHandle($bitmap.GetHicon())
+          $stream = [System.IO.File]::Open($iconPath, [System.IO.FileMode]::Create)
+          $icon.Save($stream)
+          $stream.Dispose()
+          $icon.Dispose()
+          $graphics.Dispose()
+          $font.Dispose()
+          $brush.Dispose()
+          $bitmap.Dispose()
+
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (!(Test-Path $csc)) {
+            throw "C# compiler not found: $csc"
+          }
+
+          $launcher = Join-Path $env:HALY_PAYLOAD 'Haly.exe'
+          & $csc /nologo /target:winexe /optimize+ /platform:anycpu /reference:System.dll /reference:System.Core.dll /reference:System.Windows.Forms.dll /win32icon:$iconPath /out:$launcher tools/haly/windows/HalyLauncher.cs
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $launcher)) {
+            throw 'Failed to compile Haly.exe.'
+          }
+
+          @"
+          Haly Browser $env:HALY_DISPLAY_VERSION
+
+          This is an unofficial personal rebrand based on the open-source Brave browser.
+          It is not produced, endorsed, or supported by Brave Software, Inc.
+
+          Base binary: Brave Browser $env:BRAVE_VERSION for Windows x64
+          Source changes: https://github.com/ratnanoda/brave-core/pull/2
+          Upstream source: https://github.com/brave/brave-core
+
+          Haly installs to %LOCALAPPDATA%\Programs\Haly and always uses the separate
+          profile directory %LOCALAPPDATA%\Haly\User Data. It does not register itself
+          as Brave, does not install Brave Update, and does not modify an existing Brave
+          installation or profile.
+
+          The browser and its third-party components remain subject to their original
+          open-source licenses and copyright notices.
+          "@ | Set-Content (Join-Path $env:HALY_PAYLOAD 'NOTICE-HALY.txt') -Encoding utf8
+
+          "HALY_ICON=$iconPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Validate browser executable isolation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $browser = Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter haly-browser.exe |
+            Sort-Object { $_.FullName.Split([IO.Path]::DirectorySeparatorChar).Count } |
+            Select-Object -First 1
+          if (!$browser) {
+            throw 'haly-browser.exe is missing.'
+          }
+
+          $signature = Get-AuthenticodeSignature $browser.FullName
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Brave Software') {
+            throw "The staged browser signature is invalid: $($signature.Status) / $($signature.SignerCertificate.Subject)"
+          }
+
+          $launcherBytes = [System.IO.File]::ReadAllBytes((Join-Path $env:HALY_PAYLOAD 'Haly.exe'))
+          if ($launcherBytes.Length -lt 4096) {
+            throw 'Haly launcher is unexpectedly small.'
+          }
+
+          Write-Host "Browser: $($browser.FullName)"
+          Write-Host "Private profile: %LOCALAPPDATA%\Haly\User Data"
+          Write-Host "Private install: %LOCALAPPDATA%\Programs\Haly"
+
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install nsis -y --no-progress
+          $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          if (!(Test-Path $makensis)) {
+            $makensis = 'C:\Program Files\NSIS\makensis.exe'
+          }
+          if (!(Test-Path $makensis)) {
+            throw 'makensis.exe was not found after installing NSIS.'
+          }
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist-haly'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $output = Join-Path $dist 'HalySetup-x64.exe'
+
+          & $makensis "/DPAYLOAD_DIR=$env:HALY_PAYLOAD" "/DOUTPUT_FILE=$output" "/DHALY_VERSION=$env:HALY_FILE_VERSION" "/DHALY_DISPLAY_VERSION=$env:HALY_DISPLAY_VERSION" "/DHALY_ICON=$env:HALY_ICON" tools/haly/windows/installer.nsi
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $output)) {
+            throw 'NSIS did not produce HalySetup-x64.exe.'
+          }
+
+          $hash = Get-FileHash $output -Algorithm SHA256
+          "$($hash.Hash.ToLower())  HalySetup-x64.exe" | Set-Content (Join-Path $dist 'HalySetup-x64.exe.sha256') -Encoding ascii
+          Copy-Item (Join-Path $env:HALY_PAYLOAD 'NOTICE-HALY.txt') $dist
+          Write-Host "Installer size: $([math]::Round((Get-Item $output).Length / 1MB, 1)) MiB"
+          Write-Host "SHA-256: $($hash.Hash)"
+
+      - name: Upload Haly installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Haly-Windows-x64-${{ env.HALY_DISPLAY_VERSION }}
+          path: dist-haly/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
