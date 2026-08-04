@@ -37,7 +37,7 @@ CloseApplications=yes
 RestartApplications=no
 UsePreviousAppDir=yes
 UsePreviousGroup=yes
-ChangesAssociations=yes
+ChangesAssociations=no
 CreateUninstallRegKey=yes
 Uninstallable=yes
 SetupLogging=yes
@@ -63,10 +63,6 @@ Name: "{autodesktop}\Haly"; Filename: "{app}\Haly.exe"; WorkingDir: "{app}"; Tas
 [Registry]
 Root: HKCU; Subkey: "Software\Haly"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Haly"; ValueType: string; ValueName: "ProfileDir"; ValueData: "{localappdata}\Haly\User Data"
-Root: HKCU; Subkey: "Software\Classes\haly"; ValueType: string; ValueData: "URL:Haly Internal Browser Protocol"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\haly"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
-Root: HKCU; Subkey: "Software\Classes\haly\DefaultIcon"; ValueType: string; ValueData: "{app}\Haly.exe,0"
-Root: HKCU; Subkey: "Software\Classes\haly\shell\open\command"; ValueType: string; ValueData: """{app}\Haly.exe"" ""%1"""
 
 [Run]
 Filename: "{app}\Haly.exe"; Description: "Launch Haly Browser"; Flags: nowait postinstall skipifsilent
