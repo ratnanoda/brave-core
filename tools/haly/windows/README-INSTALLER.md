@@ -2,6 +2,8 @@
 
 The distributable Windows package is built with Inno Setup. Resource-pack rewriting, executable renaming, and signature validation happen in the Windows CI build before packaging. The resulting `HalySetup-x64.exe` is an offline installer and performs no PowerShell or resource conversion on the user's computer.
 
+The CI job uses sparse checkout, so it does not download the multi-gigabyte Brave source tree merely to produce the package.
+
 Isolation boundaries:
 
 - program directory: `%LOCALAPPDATA%\Programs\Haly`
