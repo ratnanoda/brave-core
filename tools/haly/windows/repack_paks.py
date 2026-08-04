@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 The Haly Authors.
 # Use of this source code is governed by the BSD-style license found in the
-# Chromium project. The DataPack layout implemented here follows Chromium's
+# Chromium project. The DataPack layout follows Chromium's
 # tools/grit/grit/format/data_pack.py.
 
 from __future__ import annotations
@@ -10,18 +10,17 @@ import argparse
 import gzip
 import os
 import pathlib
+import re
 import struct
 import tempfile
 from dataclasses import dataclass
 
-
-UTF8_REPLACEMENTS = (
-    (b"Brave", b"Haly"),
-    (b"BRAVE", b"HALY"),
-)
-UTF16_REPLACEMENTS = tuple(
-    (source.decode("ascii").encode("utf-16-le"), target.decode("ascii").encode("utf-16-le"))
-    for source, target in UTF8_REPLACEMENTS
+BINARY, UTF8, UTF16 = range(3)
+BRAND_PATTERN = re.compile(r"\bBrave\b")
+BRAND_UPPER_PATTERN = re.compile(r"\bBRAVE\b")
+URL_REPLACEMENTS = (
+    ("brave://", "haly://"),
+    ("BRAVE://", "HALY://"),
 )
 TEXT_SUFFIXES = {
     ".css",
@@ -29,8 +28,10 @@ TEXT_SUFFIXES = {
     ".htm",
     ".html",
     ".ini",
+    ".js",
     ".json",
     ".manifest",
+    ".mjs",
     ".properties",
     ".txt",
     ".xml",
@@ -45,24 +46,102 @@ class DataPack:
     aliases: list[tuple[int, int]]
 
 
-def replace_brand_bytes(payload: bytes) -> bytes:
-    output = payload
-    for source, target in UTF8_REPLACEMENTS + UTF16_REPLACEMENTS:
-        output = output.replace(source, target)
-    return output
+def replace_urls(text: str) -> str:
+    for source, target in URL_REPLACEMENTS:
+        text = text.replace(source, target)
+    return text
 
 
-def patch_resource(payload: bytes) -> bytes:
+def replace_brand(text: str) -> str:
+    text = BRAND_PATTERN.sub("Haly", text)
+    return BRAND_UPPER_PATTERN.sub("HALY", text)
+
+
+def is_locale_pack(path: pathlib.Path) -> bool:
+    return any(part.lower() == "locales" for part in path.parts)
+
+
+def is_localized_messages_file(path: pathlib.Path) -> bool:
+    parts = [part.lower() for part in path.parts]
+    return path.name.lower() == "messages.json" and "_locales" in parts
+
+
+def printable_ratio(text: str) -> float:
+    if not text:
+        return 1.0
+    printable = sum(character.isprintable() or character in "\r\n\t" for character in text)
+    return printable / len(text)
+
+
+def decode_binary_text(payload: bytes) -> tuple[str, str] | None:
+    if b"brave://" in payload or b"BRAVE://" in payload:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if printable_ratio(text) >= 0.85:
+                return text, "utf-8"
+
+    utf16_needles = (
+        "brave://".encode("utf-16-le"),
+        "BRAVE://".encode("utf-16-le"),
+    )
+    if any(needle in payload for needle in utf16_needles) and len(payload) % 2 == 0:
+        try:
+            text = payload.decode("utf-16-le")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if printable_ratio(text) >= 0.85:
+                return text, "utf-16-le"
+    return None
+
+
+def transform_text_payload(
+    payload: bytes,
+    encoding: int,
+    *,
+    apply_brand: bool,
+) -> bytes:
+    if encoding == UTF8:
+        codec = "utf-8"
+        try:
+            text = payload.decode(codec)
+        except UnicodeDecodeError:
+            return payload
+    elif encoding == UTF16:
+        codec = "utf-16-le"
+        try:
+            text = payload.decode(codec)
+        except UnicodeDecodeError:
+            return payload
+    else:
+        decoded = decode_binary_text(payload)
+        if decoded is None:
+            return payload
+        text, codec = decoded
+
+    transformed = replace_urls(text)
+    if apply_brand:
+        transformed = replace_brand(transformed)
+    if transformed == text:
+        return payload
+    return transformed.encode(codec)
+
+
+def patch_resource(payload: bytes, encoding: int, *, apply_brand: bool) -> bytes:
     if payload.startswith(b"\x1f\x8b"):
         try:
             expanded = gzip.decompress(payload)
         except (OSError, EOFError):
-            return replace_brand_bytes(payload)
-        patched = replace_brand_bytes(expanded)
+            return payload
+        patched = transform_text_payload(expanded, BINARY, apply_brand=apply_brand)
         if patched == expanded:
             return payload
         return gzip.compress(patched, compresslevel=9, mtime=0)
-    return replace_brand_bytes(payload)
+
+    return transform_text_payload(payload, encoding, apply_brand=apply_brand)
 
 
 def read_data_pack(raw: bytes) -> DataPack:
@@ -88,7 +167,9 @@ def read_data_pack(raw: bytes) -> DataPack:
 
     entries: list[tuple[int, int]] = []
     for index in range(resource_count + 1):
-        resource_id, offset = struct.unpack_from("<HI", raw, header_size + index * entry_size)
+        resource_id, offset = struct.unpack_from(
+            "<HI", raw, header_size + index * entry_size
+        )
         entries.append((resource_id, offset))
 
     resources: list[tuple[int, bytes]] = []
@@ -120,7 +201,9 @@ def write_data_pack(pack: DataPack) -> bytes:
             raise ValueError("version 4 data packs cannot contain aliases")
         header = struct.pack("<IIB", 4, resource_count, pack.encoding)
     elif pack.version == 5:
-        header = struct.pack("<IBxxxHH", 5, pack.encoding, resource_count, alias_count)
+        header = struct.pack(
+            "<IBxxxHH", 5, pack.encoding, resource_count, alias_count
+        )
     else:
         raise ValueError(f"unsupported Chromium data pack version: {pack.version}")
 
@@ -134,7 +217,10 @@ def write_data_pack(pack: DataPack) -> bytes:
         data_offset += len(payload)
 
     index_chunks.append(struct.pack("<HI", 0, data_offset))
-    alias_chunks = [struct.pack("<HH", alias_id, target_index) for alias_id, target_index in pack.aliases]
+    alias_chunks = [
+        struct.pack("<HH", alias_id, target_index)
+        for alias_id, target_index in pack.aliases
+    ]
     return b"".join([header, *index_chunks, *alias_chunks, *data_chunks])
 
 
@@ -148,11 +234,16 @@ def atomic_write(path: pathlib.Path, data: bytes) -> None:
 def patch_pak(path: pathlib.Path) -> tuple[int, int]:
     raw = path.read_bytes()
     pack = read_data_pack(raw)
+    apply_brand = is_locale_pack(path)
     changed_resources = 0
     patched_resources: list[tuple[int, bytes]] = []
 
     for resource_id, payload in pack.resources:
-        patched = patch_resource(payload)
+        patched = patch_resource(
+            payload,
+            pack.encoding,
+            apply_brand=apply_brand,
+        )
         if patched != payload:
             changed_resources += 1
         patched_resources.append((resource_id, patched))
@@ -163,31 +254,39 @@ def patch_pak(path: pathlib.Path) -> tuple[int, int]:
     rebuilt = write_data_pack(
         DataPack(pack.version, pack.encoding, patched_resources, pack.aliases)
     )
-    # Parse the rebuilt pack before replacing the original so malformed output
-    # cannot be shipped silently.
     read_data_pack(rebuilt)
     atomic_write(path, rebuilt)
-    return changed_resources, len(raw) - len(rebuilt)
+    return changed_resources, len(rebuilt) - len(raw)
 
 
 def patch_text_file(path: pathlib.Path) -> bool:
-    raw = path.read_bytes()
-    patched = replace_brand_bytes(raw)
-    if patched == raw:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
         return False
-    atomic_write(path, patched)
+
+    transformed = replace_urls(text)
+    if is_localized_messages_file(path):
+        transformed = replace_brand(transformed)
+
+    if transformed == text:
+        return False
+    path.write_text(transformed, encoding="utf-8")
     return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Rewrite user-visible Brave branding in Chromium .pak resources."
+        description=(
+            "Safely rebrand locale strings and rewrite brave:// URL literals "
+            "without modifying WebUI identifiers."
+        )
     )
     parser.add_argument("root", type=pathlib.Path)
     parser.add_argument(
         "--include-text",
         action="store_true",
-        help="also patch selected loose text resource files",
+        help="also patch selected loose text resources",
     )
     args = parser.parse_args()
 
@@ -203,6 +302,7 @@ def main() -> int:
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
+
         if path.suffix.lower() == ".pak":
             try:
                 changed, delta = patch_pak(path)
@@ -213,11 +313,14 @@ def main() -> int:
                 pak_files += 1
                 resource_count += changed
                 byte_delta += delta
-                print(f"[Haly] patched {changed:4d} resource(s): {path}")
+                mode = "locale+URL" if is_locale_pack(path) else "URL-only"
+                print(
+                    f"[Haly] patched {changed:4d} {mode} resource(s): {path}"
+                )
         elif args.include_text and path.suffix.lower() in TEXT_SUFFIXES:
             if patch_text_file(path):
                 text_files += 1
-                print(f"[Haly] patched text resource: {path}")
+                print(f"[Haly] patched safe text resource: {path}")
 
     print(
         f"[Haly] completed: {pak_files} pack(s), {resource_count} resource(s), "
