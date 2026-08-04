@@ -164,53 +164,24 @@ jobs:
           if (!(Test-Path (Join-Path $env:HALY_PAYLOAD 'Haly.exe'))) { throw 'Haly.exe is missing.' }
           "HALY_BROWSER=$($browser.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Screenshot smoke tests
+      - name: CDP renderer and WebUI smoke tests
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check websocket-client==1.8.0
+          $diagnostics = Join-Path $env:GITHUB_WORKSPACE 'haly-smoke-diagnostics'
+          New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
+          python .\tools\haly\windows\smoke_haly.py $env:HALY_BROWSER --output $diagnostics
+          if ($LASTEXITCODE -ne 0) { throw 'Haly CDP smoke tests failed.' }
 
-          function Invoke-HalyScreenshot([string] $Name, [string] $Url) {
-            $profile = Join-Path $env:RUNNER_TEMP "haly-v5-profile-$Name"
-            $screenshot = Join-Path $env:RUNNER_TEMP "haly-v5-$Name.png"
-            $stderr = Join-Path $env:RUNNER_TEMP "haly-v5-$Name.stderr.txt"
-            Remove-Item $profile, $screenshot, $stderr -Recurse -Force -ErrorAction SilentlyContinue
-
-            $arguments = @(
-              '--headless=new',
-              '--disable-gpu',
-              '--no-sandbox',
-              '--no-first-run',
-              '--disable-background-networking',
-              '--disable-component-update',
-              '--hide-scrollbars',
-              '--window-size=1280,720',
-              "--user-data-dir=$profile",
-              "--screenshot=$screenshot",
-              $Url
-            )
-
-            $process = Start-Process -FilePath $env:HALY_BROWSER -ArgumentList $arguments -WorkingDirectory (Split-Path $env:HALY_BROWSER) -RedirectStandardError $stderr -PassThru
-            if (!$process.WaitForExit(60000)) {
-              try { $process.Kill($true) } catch {}
-              throw "$Name screenshot test timed out."
-            }
-
-            $errors = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { '' }
-            Write-Host "----- $Name stderr -----"
-            Write-Host $errors
-            if ($process.ExitCode -ne 0) { throw "$Name exited with code $($process.ExitCode)." }
-            if ($errors -match 'RESULT_CODE_KILLED_BAD_MESSAGE|Aw, Snap|BAD_MESSAGE') {
-              throw "$Name detected a renderer or WebUI failure."
-            }
-            if (!(Test-Path $screenshot) -or (Get-Item $screenshot).Length -lt 4096) {
-              throw "$Name did not produce a usable screenshot."
-            }
-            Write-Host "$Name screenshot bytes: $((Get-Item $screenshot).Length)"
-          }
-
-          Invoke-HalyScreenshot 'renderer' 'data:text/html,<title>HalySmoke</title><p>OK</p>'
-          Invoke-HalyScreenshot 'version' 'brave://version/'
-          Invoke-HalyScreenshot 'newtab' 'brave://newtab/'
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Haly-v5-smoke-diagnostics
+          path: haly-smoke-diagnostics/*
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Compile offline package with Inno Setup
         shell: pwsh
