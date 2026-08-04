@@ -18,24 +18,6 @@ from dataclasses import dataclass
 BINARY, UTF8, UTF16 = range(3)
 BRAND_PATTERN = re.compile(r"\bBrave\b")
 BRAND_UPPER_PATTERN = re.compile(r"\bBRAVE\b")
-URL_REPLACEMENTS = (
-    ("brave://", "haly://"),
-    ("BRAVE://", "HALY://"),
-)
-TEXT_SUFFIXES = {
-    ".css",
-    ".desktop",
-    ".htm",
-    ".html",
-    ".ini",
-    ".js",
-    ".json",
-    ".manifest",
-    ".mjs",
-    ".properties",
-    ".txt",
-    ".xml",
-}
 
 
 @dataclass(frozen=True)
@@ -44,12 +26,6 @@ class DataPack:
     encoding: int
     resources: list[tuple[int, bytes]]
     aliases: list[tuple[int, int]]
-
-
-def replace_urls(text: str) -> str:
-    for source, target in URL_REPLACEMENTS:
-        text = text.replace(source, target)
-    return text
 
 
 def replace_brand(text: str) -> str:
@@ -66,82 +42,39 @@ def is_localized_messages_file(path: pathlib.Path) -> bool:
     return path.name.lower() == "messages.json" and "_locales" in parts
 
 
-def printable_ratio(text: str) -> float:
-    if not text:
-        return 1.0
-    printable = sum(character.isprintable() or character in "\r\n\t" for character in text)
-    return printable / len(text)
-
-
-def decode_binary_text(payload: bytes) -> tuple[str, str] | None:
-    if b"brave://" in payload or b"BRAVE://" in payload:
-        try:
-            text = payload.decode("utf-8")
-        except UnicodeDecodeError:
-            pass
-        else:
-            if printable_ratio(text) >= 0.85:
-                return text, "utf-8"
-
-    utf16_needles = (
-        "brave://".encode("utf-16-le"),
-        "BRAVE://".encode("utf-16-le"),
-    )
-    if any(needle in payload for needle in utf16_needles) and len(payload) % 2 == 0:
-        try:
-            text = payload.decode("utf-16-le")
-        except UnicodeDecodeError:
-            pass
-        else:
-            if printable_ratio(text) >= 0.85:
-                return text, "utf-16-le"
-    return None
-
-
-def transform_text_payload(
-    payload: bytes,
-    encoding: int,
-    *,
-    apply_brand: bool,
-) -> bytes:
+def transform_localized_payload(payload: bytes, encoding: int) -> bytes:
     if encoding == UTF8:
         codec = "utf-8"
-        try:
-            text = payload.decode(codec)
-        except UnicodeDecodeError:
-            return payload
     elif encoding == UTF16:
         codec = "utf-16-le"
-        try:
-            text = payload.decode(codec)
-        except UnicodeDecodeError:
-            return payload
     else:
-        decoded = decode_binary_text(payload)
-        if decoded is None:
-            return payload
-        text, codec = decoded
+        # Binary resource packs can contain JavaScript, HTML, images, IDs, or
+        # serialized objects. Do not guess their encoding or modify them.
+        return payload
 
-    transformed = replace_urls(text)
-    if apply_brand:
-        transformed = replace_brand(transformed)
+    try:
+        text = payload.decode(codec)
+    except UnicodeDecodeError:
+        return payload
+
+    transformed = replace_brand(text)
     if transformed == text:
         return payload
     return transformed.encode(codec)
 
 
-def patch_resource(payload: bytes, encoding: int, *, apply_brand: bool) -> bytes:
+def patch_resource(payload: bytes, encoding: int) -> bytes:
     if payload.startswith(b"\x1f\x8b"):
         try:
             expanded = gzip.decompress(payload)
         except (OSError, EOFError):
             return payload
-        patched = transform_text_payload(expanded, BINARY, apply_brand=apply_brand)
+        patched = transform_localized_payload(expanded, encoding)
         if patched == expanded:
             return payload
         return gzip.compress(patched, compresslevel=9, mtime=0)
 
-    return transform_text_payload(payload, encoding, apply_brand=apply_brand)
+    return transform_localized_payload(payload, encoding)
 
 
 def read_data_pack(raw: bytes) -> DataPack:
@@ -154,7 +87,9 @@ def read_data_pack(raw: bytes) -> DataPack:
         alias_count = 0
         header_size = 9
     elif version == 5:
-        encoding, resource_count, alias_count = struct.unpack_from("<BxxxHH", raw, 4)
+        encoding, resource_count, alias_count = struct.unpack_from(
+            "<BxxxHH", raw, 4
+        )
         header_size = 12
     else:
         raise ValueError(f"unsupported Chromium data pack version: {version}")
@@ -231,19 +166,14 @@ def atomic_write(path: pathlib.Path, data: bytes) -> None:
     os.replace(temporary_path, path)
 
 
-def patch_pak(path: pathlib.Path) -> tuple[int, int]:
+def patch_locale_pack(path: pathlib.Path) -> tuple[int, int]:
     raw = path.read_bytes()
     pack = read_data_pack(raw)
-    apply_brand = is_locale_pack(path)
     changed_resources = 0
     patched_resources: list[tuple[int, bytes]] = []
 
     for resource_id, payload in pack.resources:
-        patched = patch_resource(
-            payload,
-            pack.encoding,
-            apply_brand=apply_brand,
-        )
+        patched = patch_resource(payload, pack.encoding)
         if patched != payload:
             changed_resources += 1
         patched_resources.append((resource_id, patched))
@@ -254,21 +184,19 @@ def patch_pak(path: pathlib.Path) -> tuple[int, int]:
     rebuilt = write_data_pack(
         DataPack(pack.version, pack.encoding, patched_resources, pack.aliases)
     )
+    # Parse the rebuilt file before replacing the original.
     read_data_pack(rebuilt)
     atomic_write(path, rebuilt)
     return changed_resources, len(rebuilt) - len(raw)
 
 
-def patch_text_file(path: pathlib.Path) -> bool:
+def patch_localized_messages_file(path: pathlib.Path) -> bool:
     try:
         text = path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError):
         return False
 
-    transformed = replace_urls(text)
-    if is_localized_messages_file(path):
-        transformed = replace_brand(transformed)
-
+    transformed = replace_brand(text)
     if transformed == text:
         return False
     path.write_text(transformed, encoding="utf-8")
@@ -278,15 +206,16 @@ def patch_text_file(path: pathlib.Path) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Safely rebrand locale strings and rewrite brave:// URL literals "
-            "without modifying WebUI identifiers."
+            "Rebrand only localized display strings. Binary WebUI packs, "
+            "JavaScript, HTML, URL schemes, and internal identifiers are left "
+            "byte-for-byte unchanged."
         )
     )
     parser.add_argument("root", type=pathlib.Path)
     parser.add_argument(
         "--include-text",
         action="store_true",
-        help="also patch selected loose text resources",
+        help="also patch extension _locales/messages.json files",
     )
     args = parser.parse_args()
 
@@ -303,28 +232,26 @@ def main() -> int:
         if not path.is_file():
             continue
 
-        if path.suffix.lower() == ".pak":
+        if path.suffix.lower() == ".pak" and is_locale_pack(path):
             try:
-                changed, delta = patch_pak(path)
+                changed, delta = patch_locale_pack(path)
             except ValueError as error:
-                print(f"[Haly] skipped unsupported pack {path}: {error}")
+                print(f"[Haly] skipped unsupported locale pack {path}: {error}")
                 continue
             if changed:
                 pak_files += 1
                 resource_count += changed
                 byte_delta += delta
-                mode = "locale+URL" if is_locale_pack(path) else "URL-only"
-                print(
-                    f"[Haly] patched {changed:4d} {mode} resource(s): {path}"
-                )
-        elif args.include_text and path.suffix.lower() in TEXT_SUFFIXES:
-            if patch_text_file(path):
+                print(f"[Haly] patched {changed:4d} localized resource(s): {path}")
+        elif args.include_text and is_localized_messages_file(path):
+            if patch_localized_messages_file(path):
                 text_files += 1
-                print(f"[Haly] patched safe text resource: {path}")
+                print(f"[Haly] patched localized messages: {path}")
 
     print(
-        f"[Haly] completed: {pak_files} pack(s), {resource_count} resource(s), "
-        f"{text_files} loose text file(s), size delta {byte_delta:+d} bytes"
+        f"[Haly] completed: {pak_files} locale pack(s), "
+        f"{resource_count} localized resource(s), {text_files} messages file(s), "
+        f"size delta {byte_delta:+d} bytes"
     )
     return 0
 
