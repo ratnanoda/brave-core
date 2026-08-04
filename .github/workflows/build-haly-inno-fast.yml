@@ -1,4 +1,4 @@
-name: Build Haly Inno installer (sparse)
+name: Build Haly Inno installer (v4)
 
 on:
   pull_request:
@@ -16,8 +16,8 @@ jobs:
     timeout-minutes: 45
     env:
       BRAVE_VERSION: '1.92.144'
-      HALY_DISPLAY_VERSION: '1.92.144-haly.3'
-      HALY_FILE_VERSION: '1.92.144.3'
+      HALY_DISPLAY_VERSION: '1.92.144-haly.4'
+      HALY_FILE_VERSION: '1.92.144.4'
 
     steps:
       - name: Check out installer sources only
@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $work = Join-Path $env:RUNNER_TEMP 'haly-inno-build'
+          $work = Join-Path $env:RUNNER_TEMP 'haly-inno-v4-build'
           $expanded = Join-Path $work 'expanded'
           $payload = Join-Path $work 'payload'
           $application = Join-Path $payload 'Application'
@@ -61,11 +61,13 @@ jobs:
           if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Brave Software') {
             throw "Unexpected Brave signature: $($signature.Status) / $($signature.SignerCertificate.Subject)"
           }
+          Write-Host "Verified upstream browser signature: $($signature.SignerCertificate.Subject)"
 
           Copy-Item (Join-Path $candidate.Directory.FullName '*') $application -Recurse -Force
           Get-ChildItem $application -Recurse -File |
             Where-Object { $_.Name -match '^BraveUpdate.*\.exe$' } |
             Remove-Item -Force
+
           $browserExecutables = Get-ChildItem $application -Recurse -File -Filter brave.exe
           if (!$browserExecutables) { throw 'No browser executable was staged.' }
           foreach ($browserExecutable in $browserExecutables) {
@@ -76,15 +78,19 @@ jobs:
           "HALY_PAYLOAD=$payload" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "HALY_APPLICATION=$application" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Rebrand resources before packaging
+      - name: Rebrand safe UI strings and URL literals
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          python tools/haly/windows/repack_paks.py $env:HALY_APPLICATION --include-text
-          if ($LASTEXITCODE -ne 0) { throw 'Resource repacking failed.' }
-          if (Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter brave.exe) {
-            throw 'A brave.exe remains in the Haly payload.'
-          }
+          python .\tools\haly\windows\repack_paks.py $env:HALY_APPLICATION --include-text
+          if ($LASTEXITCODE -ne 0) { throw 'Safe resource repacking failed.' }
+
+      - name: Replace the internal brave scheme with haly
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python .\tools\haly\windows\patch_haly_scheme.py $env:HALY_APPLICATION
+          if ($LASTEXITCODE -ne 0) { throw 'The Haly scheme patch failed.' }
 
       - name: Compile Haly launcher and icon
         shell: pwsh
@@ -108,8 +114,10 @@ jobs:
           $stream.Dispose(); $icon.Dispose(); $graphics.Dispose(); $font.Dispose(); $brush.Dispose(); $bitmap.Dispose()
 
           $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (!(Test-Path $csc)) { throw "C# compiler was not found: $csc" }
           $launcher = Join-Path $env:HALY_PAYLOAD 'Haly.exe'
-          & $csc /nologo /target:winexe /optimize+ /platform:x64 /reference:System.dll /reference:System.Core.dll /reference:System.Windows.Forms.dll /win32icon:$iconPath /out:$launcher tools/haly/windows/HalyLauncher.cs
+          $launcherSource = (Resolve-Path '.\tools\haly\windows\HalyLauncher.cs').Path
+          & $csc /nologo /target:winexe /optimize+ /platform:x64 /reference:System.dll /reference:System.Core.dll /reference:System.Windows.Forms.dll "/win32icon:$iconPath" "/out:$launcher" $launcherSource
           if ($LASTEXITCODE -ne 0 -or !(Test-Path $launcher)) { throw 'Haly.exe compilation failed.' }
 
           @"
@@ -118,7 +126,12 @@ jobs:
           Not produced, endorsed, or supported by Brave Software, Inc.
           Install: %LOCALAPPDATA%\Programs\Haly
           Profile: %LOCALAPPDATA%\Haly\User Data
+          Internal scheme: haly://
           Source: https://github.com/ratnanoda/brave-core/pull/2
+
+          The upstream signature was validated before rebranding. Modifying PE
+          resources and the internal URL scheme invalidates the upstream binary
+          signature by design. The Haly installer itself is not code-signed.
           "@ | Set-Content (Join-Path $env:HALY_PAYLOAD 'NOTICE-HALY.txt') -Encoding utf8
           "HALY_ICON=$iconPath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -126,13 +139,68 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $browser = Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter haly-browser.exe | Select-Object -First 1
+          $browser = Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter haly-browser.exe |
+            Sort-Object { $_.FullName.Split([IO.Path]::DirectorySeparatorChar).Count } |
+            Select-Object -First 1
           if (!$browser) { throw 'haly-browser.exe is missing.' }
-          $signature = Get-AuthenticodeSignature $browser.FullName
-          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Brave Software') {
-            throw 'The renamed browser no longer has the expected valid signature.'
+          if (Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter brave.exe) {
+            throw 'A brave.exe remains in the Haly payload.'
+          }
+          if (Get-ChildItem $env:HALY_APPLICATION -Recurse -File | Where-Object { $_.Name -match '^BraveUpdate.*\.exe$' }) {
+            throw 'A Brave Update executable remains in the Haly payload.'
           }
           if (!(Test-Path (Join-Path $env:HALY_PAYLOAD 'Haly.exe'))) { throw 'Haly.exe is missing.' }
+          "HALY_BROWSER=$($browser.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Smoke-test renderer and Haly internal pages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-HalySmoke([string] $Name, [string] $Url) {
+            $profile = Join-Path $env:RUNNER_TEMP "haly-smoke-$Name"
+            $stdout = Join-Path $env:RUNNER_TEMP "haly-smoke-$Name.stdout.txt"
+            $stderr = Join-Path $env:RUNNER_TEMP "haly-smoke-$Name.stderr.txt"
+            Remove-Item $profile, $stdout, $stderr -Recurse -Force -ErrorAction SilentlyContinue
+
+            $arguments = @(
+              '--headless=new',
+              '--disable-gpu',
+              '--no-sandbox',
+              '--no-first-run',
+              '--disable-background-networking',
+              '--disable-component-update',
+              "--user-data-dir=$profile",
+              '--dump-dom',
+              $Url
+            )
+
+            $process = Start-Process -FilePath $env:HALY_BROWSER -ArgumentList $arguments -WorkingDirectory (Split-Path $env:HALY_BROWSER) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+            if (!$process.WaitForExit(60000)) {
+              try { $process.Kill($true) } catch {}
+              throw "$Name smoke test timed out."
+            }
+
+            $output = ''
+            if (Test-Path $stdout) { $output += Get-Content $stdout -Raw }
+            if (Test-Path $stderr) { $output += "`n" + (Get-Content $stderr -Raw) }
+            Write-Host "----- $Name output -----"
+            Write-Host $output
+
+            if ($process.ExitCode -ne 0) {
+              throw "$Name smoke test exited with code $($process.ExitCode)."
+            }
+            if ($output -match 'RESULT_CODE_KILLED_BAD_MESSAGE|Aw, Snap|このページを開けません') {
+              throw "$Name smoke test detected a renderer or WebUI failure."
+            }
+            if ($output.Length -lt 20) {
+              throw "$Name smoke test returned unexpectedly little output."
+            }
+          }
+
+          Invoke-HalySmoke 'renderer' 'data:text/html,<title>HalySmoke</title><p>OK</p>'
+          Invoke-HalySmoke 'version' 'haly://version/'
+          Invoke-HalySmoke 'newtab' 'haly://newtab/'
 
       - name: Compile offline package with Inno Setup
         shell: pwsh
@@ -145,7 +213,8 @@ jobs:
           $output = Join-Path $env:GITHUB_WORKSPACE 'dist-haly-inno'
           New-Item -ItemType Directory -Force -Path $output | Out-Null
           $env:HALY_OUTPUT = $output
-          & $iscc tools/haly/windows/installer.iss
+          $installerScript = (Resolve-Path '.\tools\haly\windows\installer.iss').Path
+          & $iscc $installerScript
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
 
           $installer = Join-Path $output 'HalySetup-x64.exe'
