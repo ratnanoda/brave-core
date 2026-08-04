@@ -5,10 +5,14 @@
 
 import config from '../lib/config.ts'
 import { applyHalyRebrand } from '../lib/halyRebrand.js'
+import { applyHalySchemeRebrand } from '../lib/halySchemeRebrand.js'
 
 const check = process.argv.includes('--check')
-const changedFiles = await applyHalyRebrand(config.braveCoreDir, { check })
+const changedResources = await applyHalyRebrand(config.braveCoreDir, { check })
+const changedSchemes = await applyHalySchemeRebrand(config.braveCoreDir, {
+  check,
+})
 
-if (check && changedFiles.length > 0) {
+if (check && (changedResources.length > 0 || changedSchemes.length > 0)) {
   process.exitCode = 1
 }
