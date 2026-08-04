@@ -1,0 +1,209 @@
+name: Build Haly Inno installer
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'tools/haly/windows/**'
+      - '.github/workflows/build-haly-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      BRAVE_VERSION: '1.92.144'
+      HALY_DISPLAY_VERSION: '1.92.144-haly.3'
+      HALY_FILE_VERSION: '1.92.144.3'
+
+    steps:
+      - name: Check out Haly sources
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Download and stage the official Brave payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'haly-inno-build'
+          $expanded = Join-Path $work 'expanded'
+          $payload = Join-Path $work 'payload'
+          $application = Join-Path $payload 'Application'
+          New-Item -ItemType Directory -Force -Path $work, $expanded, $application | Out-Null
+
+          $archiveName = "brave-v$env:BRAVE_VERSION-win32-x64.zip"
+          $archive = Join-Path $work $archiveName
+          $url = "https://github.com/brave/brave-browser/releases/download/v$env:BRAVE_VERSION/$archiveName"
+          curl.exe -L --fail --retry 5 --retry-delay 4 --output $archive $url
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $archive) -or (Get-Item $archive).Length -lt 50MB) {
+            throw 'The official Brave x64 ZIP could not be downloaded.'
+          }
+
+          Expand-Archive -LiteralPath $archive -DestinationPath $expanded -Force
+          $candidate = Get-ChildItem $expanded -Recurse -File -Filter brave.exe |
+            Sort-Object { $_.FullName.Split([IO.Path]::DirectorySeparatorChar).Count } |
+            Select-Object -First 1
+          if (!$candidate) {
+            throw 'The official Brave package does not contain brave.exe.'
+          }
+
+          $signature = Get-AuthenticodeSignature $candidate.FullName
+          if ($signature.Status -ne 'Valid') {
+            throw "The Brave browser signature is invalid: $($signature.Status)"
+          }
+          if ($signature.SignerCertificate.Subject -notmatch 'Brave Software') {
+            throw "Unexpected browser signer: $($signature.SignerCertificate.Subject)"
+          }
+
+          Copy-Item (Join-Path $candidate.Directory.FullName '*') $application -Recurse -Force
+
+          Get-ChildItem $application -Recurse -File |
+            Where-Object { $_.Name -match '^BraveUpdate.*\.exe$' -or $_.Name -eq 'BraveUpdate.exe' } |
+            Remove-Item -Force
+
+          $browserExecutables = Get-ChildItem $application -Recurse -File -Filter brave.exe
+          if (!$browserExecutables) {
+            throw 'No browser executable was staged.'
+          }
+          foreach ($browserExecutable in $browserExecutables) {
+            Rename-Item $browserExecutable.FullName 'haly-browser.exe'
+          }
+
+          "HALY_WORK=$work" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "HALY_PAYLOAD=$payload" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "HALY_APPLICATION=$application" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Rebrand browser resources before packaging
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/haly/windows/repack_paks.py $env:HALY_APPLICATION --include-text
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Resource repacking failed.'
+          }
+          if (Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter brave.exe) {
+            throw 'A brave.exe remains in the isolated Haly payload.'
+          }
+
+      - name: Compile the native Haly launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Drawing
+
+          $iconPath = Join-Path $env:HALY_WORK 'Haly.ico'
+          $bitmap = New-Object System.Drawing.Bitmap 256, 256
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+          $graphics.Clear([System.Drawing.Color]::FromArgb(70, 42, 140))
+          $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+          $font = New-Object System.Drawing.Font 'Segoe UI', 150, ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
+          $format = New-Object System.Drawing.StringFormat
+          $format.Alignment = [System.Drawing.StringAlignment]::Center
+          $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+          $graphics.DrawString('H', $font, $brush, (New-Object System.Drawing.RectangleF 0, 0, 256, 246), $format)
+          $icon = [System.Drawing.Icon]::FromHandle($bitmap.GetHicon())
+          $stream = [System.IO.File]::Open($iconPath, [System.IO.FileMode]::Create)
+          $icon.Save($stream)
+          $stream.Dispose()
+          $icon.Dispose()
+          $graphics.Dispose()
+          $font.Dispose()
+          $brush.Dispose()
+          $bitmap.Dispose()
+
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (!(Test-Path $csc)) {
+            throw "C# compiler not found: $csc"
+          }
+          $launcher = Join-Path $env:HALY_PAYLOAD 'Haly.exe'
+          & $csc /nologo /target:winexe /optimize+ /platform:x64 /reference:System.dll /reference:System.Core.dll /reference:System.Windows.Forms.dll /win32icon:$iconPath /out:$launcher tools/haly/windows/HalyLauncher.cs
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $launcher)) {
+            throw 'Haly.exe could not be compiled.'
+          }
+
+          @"
+          Haly Browser $env:HALY_DISPLAY_VERSION
+
+          This is an unofficial personal rebrand based on the open-source Brave browser.
+          It is not produced, endorsed, or supported by Brave Software, Inc.
+
+          Base payload: official Brave Browser $env:BRAVE_VERSION Windows x64 ZIP
+          Source changes: https://github.com/ratnanoda/brave-core/pull/2
+
+          Install directory: %LOCALAPPDATA%\Programs\Haly
+          Profile directory: %LOCALAPPDATA%\Haly\User Data
+
+          The installer does not install Brave Update, register itself as Brave, or modify
+          an existing Brave installation or profile. Components remain subject to their
+          original licenses and copyright notices.
+          "@ | Set-Content (Join-Path $env:HALY_PAYLOAD 'NOTICE-HALY.txt') -Encoding utf8
+
+          "HALY_ICON=$iconPath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Validate isolated payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $browser = Get-ChildItem $env:HALY_APPLICATION -Recurse -File -Filter haly-browser.exe |
+            Sort-Object { $_.FullName.Split([IO.Path]::DirectorySeparatorChar).Count } |
+            Select-Object -First 1
+          if (!$browser) {
+            throw 'haly-browser.exe is missing.'
+          }
+          $signature = Get-AuthenticodeSignature $browser.FullName
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Brave Software') {
+            throw "The renamed browser signature is invalid: $($signature.Status)"
+          }
+          if (!(Test-Path (Join-Path $env:HALY_PAYLOAD 'Haly.exe'))) {
+            throw 'Haly.exe is missing.'
+          }
+          Write-Host "Payload size: $([math]::Round(((Get-ChildItem $env:HALY_PAYLOAD -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)) MiB"
+
+      - name: Build offline installer with Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (!(Test-Path $iscc)) {
+            throw 'Inno Setup compiler was not found.'
+          }
+
+          $output = Join-Path $env:GITHUB_WORKSPACE 'dist-haly-inno'
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          $env:HALY_OUTPUT = $output
+          & $iscc tools/haly/windows/installer.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Inno Setup compilation failed.'
+          }
+
+          $installer = Join-Path $output 'HalySetup-x64.exe'
+          if (!(Test-Path $installer) -or (Get-Item $installer).Length -lt 50MB) {
+            throw 'The offline Haly installer is missing or unexpectedly small.'
+          }
+          $hash = Get-FileHash $installer -Algorithm SHA256
+          "$($hash.Hash.ToLower())  HalySetup-x64.exe" | Set-Content (Join-Path $output 'HalySetup-x64.exe.sha256') -Encoding ascii
+          Copy-Item (Join-Path $env:HALY_PAYLOAD 'NOTICE-HALY.txt') $output
+          Write-Host "Installer size: $([math]::Round((Get-Item $installer).Length / 1MB, 1)) MiB"
+          Write-Host "SHA-256: $($hash.Hash)"
+
+      - name: Upload offline installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Haly-Inno-Windows-x64-${{ env.HALY_DISPLAY_VERSION }}
+          path: dist-haly-inno/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
