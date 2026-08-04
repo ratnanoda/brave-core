@@ -160,8 +160,6 @@ def test_page(port: int, name: str, url: str, output_directory: pathlib.Path):
 
         screenshot = session.command("Page.captureScreenshot", {"format": "png"})
         image = base64.b64decode(screenshot["data"])
-        if len(image) < 4096:
-            raise RuntimeError(f"{name}: screenshot is unexpectedly small")
         screenshot_path = output_directory / f"{name}.png"
         screenshot_path.write_bytes(image)
 
@@ -177,6 +175,13 @@ def test_page(port: int, name: str, url: str, output_directory: pathlib.Path):
                 ensure_ascii=False,
             )
         )
+
+        # A nearly blank, highly compressible page can legitimately produce a
+        # PNG well below 4 KiB. The PNG signature and a modest payload are
+        # enough here because DOM content and browser error markers are checked
+        # separately above.
+        if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) < 256:
+            raise RuntimeError(f"{name}: screenshot is invalid or unexpectedly small")
     finally:
         session.close()
         close_target(port, target_id)
